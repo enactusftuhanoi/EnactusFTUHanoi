@@ -1,4 +1,4 @@
-// index.js - Enactus FTU Hanoi Discord Bot
+// index.js - Enactus FTU Hanoi Discord Bot - FIXED VERSION
 require('dotenv').config();
 const { 
   Client, 
@@ -17,36 +17,8 @@ const {
   Collection
 } = require('discord.js');
 
-// index.js - THÊM ĐOẠN NÀY
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-  res.send('Bot is alive');
-});
-
-app.listen(PORT, () => {
-  console.log(`Health server on ${PORT}`);
-  
-  // Tự ping mình mỗi 5 phút
-  setInterval(() => {
-    fetch(`http://localhost:${PORT}`).catch(() => {});
-  }, 300000);
-});
-
-// Import Firebase từ SDK mới (v10+)
-const { initializeApp } = require('firebase/app');
-const { 
-  getFirestore, 
-  collection, 
-  query, 
-  where, 
-  getDocs, 
-  updateDoc, 
-  doc,
-  Timestamp 
-} = require('firebase/firestore');
+// Firebase Admin SDK (đúng cho server-side)
+const admin = require('firebase-admin');
 
 // ====================
 // CONFIGURATION & INIT
@@ -59,17 +31,11 @@ console.log(`
 ╚══════════════════════════════════════════════════╝
 `);
 
-// Kiểm tra biến môi trường
+// Kiểm tra biến môi trường cần thiết
 const requiredEnvVars = [
   'DISCORD_TOKEN',
   'DISCORD_CLIENT_ID', 
-  'DISCORD_GUILD_ID',
-  'FIREBASE_API_KEY',
-  'FIREBASE_AUTH_DOMAIN',
-  'FIREBASE_PROJECT_ID',
-  'FIREBASE_STORAGE_BUCKET',
-  'FIREBASE_MESSAGING_SENDER_ID',
-  'FIREBASE_APP_ID'
+  'DISCORD_GUILD_ID'
 ];
 
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
@@ -83,26 +49,37 @@ if (missingVars.length > 0) {
 // FIREBASE INITIALIZATION
 // ====================
 
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID,
-  measurementId: process.env.FIREBASE_MEASUREMENT_ID
-};
-
-let firebaseApp;
-let db;
+let db = null;
 
 try {
-  firebaseApp = initializeApp(firebaseConfig);
-  db = getFirestore(firebaseApp);
-  console.log('✅ Firebase initialized successfully');
+  // Initialize Firebase từ base64 hoặc service account
+  if (process.env.FIREBASE_CREDENTIALS_BASE64) {
+    // Production (Render) - dùng base64 từ env var
+    const serviceAccount = JSON.parse(
+      Buffer.from(process.env.FIREBASE_CREDENTIALS_BASE64, 'base64').toString()
+    );
+    
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('✅ Firebase initialized from environment variable');
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    // Development - dùng service account file
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault()
+    });
+    console.log('✅ Firebase initialized from service account file');
+  } else {
+    console.log('⚠️ Firebase not initialized - running without database');
+  }
+  
+  if (admin.apps.length > 0) {
+    db = admin.firestore();
+    console.log('✅ Firebase Firestore connected');
+  }
 } catch (error) {
-  console.error('❌ Firebase initialization failed:', error.message);
-  process.exit(1);
+  console.error('❌ Firebase initialization error:', error.message);
+  console.log('⚠️ Running without Firebase - some features may be disabled');
 }
 
 // ====================
@@ -154,6 +131,7 @@ function formatDate(dateString) {
  * Format time remaining
  */
 function formatTimeRemaining(ms) {
+  if (ms <= 0) return 'Đã hết hạn';
   const hours = Math.floor(ms / (1000 * 60 * 60));
   const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
   return `${hours} giờ ${minutes} phút`;
@@ -197,7 +175,7 @@ async function createVerificationChannel(member) {
     // Create user-specific verification channel
     const channelName = `verify-${member.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
     const verifyChannel = await guild.channels.create({
-      name: channelName.substring(0, 100), // Discord channel name limit
+      name: channelName.substring(0, 100),
       type: ChannelType.GuildText,
       parent: verificationCategory.id,
       topic: `Verification for ${member.user.tag} | ID: ${member.id}`,
@@ -244,23 +222,26 @@ async function createVerificationChannel(member) {
  * Find member in Firebase by email
  */
 async function findMemberByEmail(email) {
+  if (!db) {
+    console.log('⚠️ Firebase not available - cannot search members');
+    return null;
+  }
+  
   try {
     const normalizedEmail = email.toLowerCase().trim();
-    const membersRef = collection(db, "members");
-    const q = query(membersRef, where("email", "==", normalizedEmail));
-    const querySnapshot = await getDocs(q);
+    const membersRef = db.collection("members");
+    const snapshot = await membersRef.where("email", "==", normalizedEmail).get();
     
-    if (querySnapshot.empty) {
+    if (snapshot.empty) {
       return null;
     }
     
-    const userDoc = querySnapshot.docs[0];
+    const userDoc = snapshot.docs[0];
     const userData = userDoc.data();
     
     return {
       docId: userDoc.id,
       ...userData,
-      // Ensure all required fields exist
       name: userData.name || 'Chưa cập nhật',
       ban: userData.ban || 'Chưa xác định',
       role: userData.role || 'Member',
@@ -270,7 +251,7 @@ async function findMemberByEmail(email) {
     
   } catch (error) {
     console.error('❌ Error searching Firebase:', error);
-    throw error;
+    return null;
   }
 }
 
@@ -278,20 +259,25 @@ async function findMemberByEmail(email) {
  * Update Discord info in Firebase
  */
 async function updateDiscordInfo(docId, discordData) {
+  if (!db) {
+    console.log('⚠️ Firebase not available - cannot update info');
+    return false;
+  }
+  
   try {
-    const memberRef = doc(db, "members", docId);
-    await updateDoc(memberRef, {
+    const memberRef = db.collection("members").doc(docId);
+    await memberRef.update({
       discord_id: discordData.id,
       discord_username: discordData.tag,
       discord_display_name: discordData.displayName,
-      verified_at: Timestamp.now(),
+      verified_at: admin.firestore.FieldValue.serverTimestamp(),
       verified: true,
-      last_updated: Timestamp.now()
+      last_updated: admin.firestore.FieldValue.serverTimestamp()
     });
     return true;
   } catch (error) {
     console.error('❌ Error updating Firebase:', error);
-    throw error;
+    return false;
   }
 }
 
@@ -322,29 +308,22 @@ function checkCooldown(userId, command, cooldownSeconds = 5) {
  */
 function createWelcomeEmbed(member) {
   return new EmbedBuilder()
-    .setColor('#00B0F4') // Enactus blue
+    .setColor('#00B0F4')
     .setTitle(`🎉 Chào mừng ${member.user.username} đến với Enactus FTU Hà Nội!`)
     .setDescription(`Xin chào <@${member.id}>, chào mừng bạn đến với cộng đồng Enactus FTU Hanoi!`)
     .addFields(
-      { name: '📋 **Bước 1**', value: 'Vào kênh <#verify>', inline: true },
+      { name: '📋 **Bước 1**', value: 'Vào kênh #verify', inline: true },
       { name: '🔐 **Bước 2**', value: 'Dùng lệnh `/verify`', inline: true },
       { name: '📧 **Bước 3**', value: 'Nhập email Enactus của bạn', inline: true },
       { 
         name: '⏰ **Lưu ý quan trọng**', 
         value: 'Bạn có **2 giờ** để hoàn tất xác minh. Sau thời gian này, bạn sẽ bị tự động rời khỏi server.', 
         inline: false 
-      },
-      { 
-        name: '❓ **Cần hỗ trợ?**', 
-        value: 'Liên hệ <@&ADMIN_ROLE_ID> hoặc <@&TECH_ROLE_ID> nếu gặp vấn đề', 
-        inline: false 
       }
     )
     .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
-    .setImage('https://i.imgur.com/EnactusBanner.png') // Add your banner image
     .setFooter({ 
-      text: 'Enactus FTU Hanoi | Hệ thống xác minh tự động',
-      iconURL: 'https://enactus.org/wp-content/uploads/2021/05/cropped-favicon-32x32.png'
+      text: 'Enactus FTU Hanoi | Hệ thống xác minh tự động'
     })
     .setTimestamp();
 }
@@ -354,7 +333,7 @@ function createWelcomeEmbed(member) {
  */
 function createVerificationInfoEmbed(userData, email) {
   return new EmbedBuilder()
-    .setColor('#FF9800') // Orange
+    .setColor('#FF9800')
     .setTitle('🔍 XÁC NHẬN THÔNG TIN THÀNH VIÊN')
     .setDescription(`Xin chào **${userData.name}**!\n\nVui lòng kiểm tra kỹ thông tin bên dưới trước khi xác nhận:`)
     .addFields(
@@ -367,16 +346,10 @@ function createVerificationInfoEmbed(userData, email) {
         name: '🏛️ **THÔNG TIN ENACTUS**', 
         value: `**Ban:** ${userData.ban}\n**Vai trò:** ${userData.role}\n**Trạng thái:** ${userData.process}`,
         inline: false 
-      },
-      { 
-        name: '📞 **THÔNG TIN LIÊN HỆ**', 
-        value: `**Ngày sinh:** ${formatDate(userData.dob)}\n**Số điện thoại:** ${userData.phone || 'Chưa cập nhật'}`,
-        inline: false 
       }
     )
     .setFooter({ 
-      text: 'Enactus FTU Hà Nội • Vui lòng xác nhận trong 10 phút',
-      iconURL: 'https://enactus.org/wp-content/uploads/2021/05/cropped-favicon-32x32.png'
+      text: 'Enactus FTU Hà Nội • Vui lòng xác nhận trong 10 phút'
     })
     .setTimestamp();
 }
@@ -386,24 +359,18 @@ function createVerificationInfoEmbed(userData, email) {
  */
 function createSuccessEmbed(member, userData, roleName) {
   return new EmbedBuilder()
-    .setColor('#4CAF50') // Green
+    .setColor('#4CAF50')
     .setTitle('✅ XÁC MINH THÀNH CÔNG!')
     .setDescription(`**Chào mừng ${userData.name} đến với Enactus FTU Hà Nội Discord Server!**`)
     .addFields(
       { name: '🎉 **CHÚC MỪNG**', value: 'Bạn đã được xác minh thành công và đã nhận đầy đủ quyền truy cập!', inline: false },
       { name: '🏷️ **ROLE ĐÃ NHẬN**', value: `\`${roleName}\``, inline: true },
       { name: '🏛️ **BAN**', value: userData.ban, inline: true },
-      { name: '📋 **VAI TRÒ**', value: userData.role, inline: true },
-      { 
-        name: '💡 **TIẾP THEO**', 
-        value: 'Hãy tham gia các kênh phù hợp với ban của bạn và giới thiệu bản thân với mọi người!',
-        inline: false 
-      }
+      { name: '📋 **VAI TRÒ**', value: userData.role, inline: true }
     )
     .setThumbnail(member.user.displayAvatarURL({ size: 128 }))
     .setFooter({ 
-      text: 'Enactus FTU Hanoi - Chào mừng thành viên mới!',
-      iconURL: 'https://enactus.org/wp-content/uploads/2021/05/cropped-favicon-32x32.png'
+      text: 'Enactus FTU Hanoi - Chào mừng thành viên mới!'
     })
     .setTimestamp();
 }
@@ -429,12 +396,12 @@ client.once('ready', async () => {
   await registerCommands();
   
   // Start periodic checks
-  setInterval(checkUnverifiedMembers, 15 * 60 * 1000); // Every 15 minutes
+  setInterval(checkUnverifiedMembers, 15 * 60 * 1000);
   
   // Set bot status
   client.user.setPresence({
     activities: [{
-      name: 'Enactus FTU Verification',
+      name: '/verify để xác minh',
       type: 3 // WATCHING
     }],
     status: 'online'
@@ -464,101 +431,23 @@ client.on('guildMemberAdd', async (member) => {
       console.log(`✅ Added ${visitorRole.name} role to ${member.user.tag}`);
     }
     
-    // Send welcome message
-    const welcomeChannel = member.guild.channels.cache.find(channel => 
-      channel.name.includes('welcome') || 
-      channel.name.includes('general')
+    // Send welcome message to general channel
+    const generalChannel = member.guild.channels.cache.find(channel => 
+      channel.name.includes('general') && 
+      channel.type === ChannelType.GuildText
     );
     
-    if (welcomeChannel) {
+    if (generalChannel) {
       const welcomeEmbed = createWelcomeEmbed(member);
-      await welcomeChannel.send({ 
+      await generalChannel.send({ 
         content: `Chào mừng <@${member.id}>! 🎉`,
         embeds: [welcomeEmbed] 
       });
     }
     
-    // Send DM instructions
-    try {
-      const dmEmbed = new EmbedBuilder()
-        .setColor('#2196F3')
-        .setTitle('🔐 XÁC MINH THÀNH VIÊN ENACTUS FTU')
-        .setDescription(`Chào ${member.user.username}, chào mừng bạn đến với Enactus FTU Hanoi Discord Server!`)
-        .addFields(
-          { 
-            name: '📋 **HƯỚNG DẪN XÁC MINH**', 
-            value: '1. Vào kênh **#verify** (nếu không thấy, dùng lệnh `/verify` ở bất kỳ kênh nào)\n2. Dùng lệnh **/verify**\n3. Nhập email Enactus của bạn\n4. Xác nhận thông tin hiển thị',
-            inline: false 
-          },
-          { 
-            name: '⏰ **THỜI HẠN XÁC MINH**', 
-            value: '**2 GIỜ** - Sau thời gian này bạn sẽ bị tự động rời khỏi server nếu chưa xác minh',
-            inline: false 
-          },
-          { 
-            name: '📧 **YÊU CẦU EMAIL**', 
-            value: 'Email có chứa **enactus** (ví dụ: name@enactusftu... hoặc ...@enactus.org)',
-            inline: false 
-          },
-          { 
-            name: '❓ **HỖ TRỢ**', 
-            value: 'Liên hệ Ban Kỹ thuật nếu gặp vấn đề hoặc email không khớp',
-            inline: false 
-          }
-        )
-        .setFooter({ text: 'Enactus FTU Hanoi - Hệ thống xác minh tự động' })
-        .setTimestamp();
-      
-      await member.send({ embeds: [dmEmbed] });
-      console.log(`📩 Sent verification instructions to ${member.user.tag}`);
-      
-    } catch (dmError) {
-      console.log(`⚠️ Could not send DM to ${member.user.tag} (DMs might be closed)`);
-    }
-    
     // Set verification timeout (2 hours)
     const timeout = setTimeout(async () => {
-      try {
-        const freshMember = await member.guild.members.fetch(member.id).catch(() => null);
-        if (!freshMember) return;
-        
-        const isVerified = freshMember.roles.cache.some(role => 
-          role.name === 'Enactus Member' || 
-          role.name === 'Member' ||
-          role.name === 'Verified'
-        );
-        
-        if (!isVerified) {
-          console.log(`⏰ Verification timeout for ${member.user.tag}, kicking...`);
-          
-          try {
-            await member.send({
-              embeds: [
-                new EmbedBuilder()
-                  .setColor('#F44336')
-                  .setTitle('⏰ HẾT THỜI GIAN XÁC MINH')
-                  .setDescription('Rất tiếc, bạn đã bị tự động rời khỏi server vì không hoàn thành xác minh trong 2 giờ.')
-                  .addFields(
-                    { name: '📅 Thời gian tham gia', value: new Date(member.joinedTimestamp).toLocaleString('vi-VN') },
-                    { name: '🔄 Tham gia lại', value: 'Bạn có thể join lại server và thử xác minh lần nữa' },
-                    { name: '❓ Hỗ trợ', value: 'Nếu gặp vấn đề kỹ thuật, vui lòng liên hệ Ban Kỹ thuật' }
-                  )
-                  .setFooter({ text: 'Enactus FTU Hanoi' })
-                  .setTimestamp()
-              ]
-            });
-          } catch (dmError) {}
-          
-          await member.kick('Không hoàn thành xác minh trong 2 giờ');
-          console.log(`🚫 Kicked ${member.user.tag} - Verification timeout`);
-          
-          // Clean up
-          pendingVerifications.delete(member.id);
-          verificationTimeouts.delete(member.id);
-        }
-      } catch (error) {
-        console.error(`❌ Error in timeout handler for ${member.user.tag}:`, error);
-      }
+      await handleVerificationTimeout(member);
     }, 2 * 60 * 60 * 1000);
     
     verificationTimeouts.set(member.id, timeout);
@@ -568,13 +457,52 @@ client.on('guildMemberAdd', async (member) => {
   }
 });
 
+/**
+ * Handle verification timeout
+ */
+async function handleVerificationTimeout(member) {
+  try {
+    const freshMember = await member.guild.members.fetch(member.id).catch(() => null);
+    if (!freshMember) return;
+    
+    const isVerified = freshMember.roles.cache.some(role => 
+      role.name === 'Enactus Member' || 
+      role.name === 'Member' ||
+      role.name === 'Verified'
+    );
+    
+    if (!isVerified) {
+      console.log(`⏰ Verification timeout for ${member.user.tag}, kicking...`);
+      
+      try {
+        await member.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor('#F44336')
+              .setTitle('⏰ HẾT THỜI GIAN XÁC MINH')
+              .setDescription('Rất tiếc, bạn đã bị tự động rời khỏi server vì không hoàn thành xác minh trong 2 giờ.')
+              .setFooter({ text: 'Enactus FTU Hanoi' })
+              .setTimestamp()
+          ]
+        });
+      } catch (dmError) {}
+      
+      await member.kick('Không hoàn thành xác minh trong 2 giờ');
+      console.log(`🚫 Kicked ${member.user.tag} - Verification timeout`);
+      
+      // Clean up
+      pendingVerifications.delete(member.id);
+      verificationTimeouts.delete(member.id);
+    }
+  } catch (error) {
+    console.error(`❌ Error in timeout handler for ${member.user.tag}:`, error);
+  }
+}
+
 // ====================
 // SLASH COMMAND HANDLERS
 // ====================
 
-/**
- * Handle /verify command
- */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   
@@ -643,19 +571,6 @@ async function handleVerifyCommand(interaction) {
     return;
   }
   
-  // Check for existing verification channel
-  const existingChannel = interaction.guild.channels.cache.find(channel => 
-    channel.name.includes(`verify-${member.user.username.toLowerCase().split('#')[0]}`)
-  );
-  
-  if (existingChannel) {
-    await interaction.reply({
-      content: `📁 Bạn đã có kênh xác minh rồi: ${existingChannel}\n\nVui lòng vào kênh đó để tiếp tục.`,
-      ephemeral: true
-    });
-    return;
-  }
-  
   // Create verification modal
   const modal = new ModalBuilder()
     .setCustomId('verifyModal')
@@ -691,16 +606,16 @@ async function handleStatusCommand(interaction) {
   
   if (memberRole && member.roles.cache.has(memberRole.id)) {
     description = `✅ **Bạn đã được xác minh thành công!**\n\n🏷️ **Role:** ${memberRole.name}\n📅 **Tham gia:** ${new Date(member.joinedTimestamp).toLocaleDateString('vi-VN')}`;
-    color = 0x4CAF50; // Green
+    color = 0x4CAF50;
   } else if (visitorRole && member.roles.cache.has(visitorRole.id)) {
     const timeLeft = 2 * 60 * 60 * 1000 - (Date.now() - member.joinedTimestamp);
     const timeLeftFormatted = formatTimeRemaining(timeLeft);
     
     description = `⚠️ **Bạn chưa được xác minh!**\n\n⏳ **Thời gian còn lại:** ${timeLeftFormatted}\n📅 **Tham gia:** ${new Date(member.joinedTimestamp).toLocaleDateString('vi-VN')}\n\n🔐 **Hành động cần thiết:** Dùng lệnh \`/verify\` để bắt đầu xác minh.`;
-    color = 0xFF9800; // Orange
+    color = 0xFF9800;
   } else {
     description = '❓ **Trạng thái không xác định.**\n\nVui lòng liên hệ quản trị viên để được hỗ trợ.';
-    color = 0xF44336; // Red
+    color = 0xF44336;
   }
   
   const statusEmbed = new EmbedBuilder()
@@ -730,7 +645,7 @@ async function handleHelpCommand(interaction) {
       },
       { 
         name: '📊 **/status**', 
-        value: 'Kiểm tra trạng thái xác minh của bạn\nXem thời gian còn lại để hoàn thành xác minh',
+        value: 'Kiểm tra trạng thái xác minh của bạn',
         inline: false 
       },
       { 
@@ -742,21 +657,10 @@ async function handleHelpCommand(interaction) {
         name: '⏰ **THỜI HẠN**', 
         value: '2 giờ kể từ khi tham gia server\nSau thời gian này, tài khoản chưa xác minh sẽ bị tự động xóa',
         inline: false 
-      },
-      { 
-        name: '📧 **YÊU CẦU**', 
-        value: 'Email có chứa **enactus**\nEmail phải tồn tại trong hệ thống Enactus FTU',
-        inline: false 
-      },
-      { 
-        name: '❓ **HỖ TRỢ**', 
-        value: 'Liên hệ Ban Kỹ thuật nếu:\n• Email không khớp\n• Thông tin hiển thị sai\n• Gặp lỗi kỹ thuật',
-        inline: false 
       }
     )
     .setFooter({ 
-      text: 'Enactus FTU Hanoi - Hệ thống xác minh tự động',
-      iconURL: 'https://enactus.org/wp-content/uploads/2021/05/cropped-favicon-32x32.png'
+      text: 'Enactus FTU Hanoi - Hệ thống xác minh tự động'
     })
     .setTimestamp();
   
@@ -770,9 +674,6 @@ async function handleHelpCommand(interaction) {
 // MODAL & BUTTON HANDLERS
 // ====================
 
-/**
- * Handle modal submissions
- */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isModalSubmit()) return;
   
@@ -889,8 +790,7 @@ client.on('interactionCreate', async (interaction) => {
             .setDescription(`Đã tạo kênh xác minh riêng cho bạn: ${verifyChannel}`)
             .addFields(
               { name: '📁 Kênh', value: `${verifyChannel}` },
-              { name: '⏳ Thời gian', value: 'Vui lòng xác nhận trong vòng 10 phút' },
-              { name: '🔐 Bảo mật', value: 'Chỉ bạn và bot có thể xem kênh này' }
+              { name: '⏳ Thời gian', value: 'Vui lòng xác nhận trong vòng 10 phút' }
             )
             .setFooter({ text: 'Enactus FTU Hanoi' })
             .setTimestamp()
@@ -917,9 +817,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-/**
- * Handle button interactions
- */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
   
@@ -993,50 +890,6 @@ client.on('interactionCreate', async (interaction) => {
         components: []
       });
       
-      // Send DM confirmation
-      try {
-        await member.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor('#4CAF50')
-              .setTitle('🎉 XÁC MINH THÀNH CÔNG!')
-              .setDescription('**Bạn đã được xác minh thành công và đã nhận đầy đủ quyền truy cập vào Enactus FTU Discord Server!**')
-              .addFields(
-                { name: '📧 Email', value: pendingData.email },
-                { name: '👤 Tên', value: pendingData.userData.name },
-                { name: '🏛️ Ban', value: pendingData.userData.ban },
-                { name: '💬 Tham gia', value: 'Hãy giới thiệu bản thân và tham gia các kênh phù hợp!' }
-              )
-              .setFooter({ text: 'Enactus FTU Hanoi' })
-              .setTimestamp()
-          ]
-        });
-      } catch (dmError) {
-        // DM might be closed, that's okay
-      }
-      
-      // Announce in welcome channel
-      const welcomeChannel = interaction.guild.channels.cache.find(channel => 
-        channel.name.includes('welcome')
-      );
-      
-      if (welcomeChannel) {
-        const announcementEmbed = new EmbedBuilder()
-          .setColor('#4CAF50')
-          .setTitle('🎉 THÀNH VIÊN MỚI ĐÃ XÁC MINH')
-          .setDescription(`Xin chào mừng **${pendingData.userData.name}** đã chính thức gia nhập Enactus FTU Discord Server!`)
-          .addFields(
-            { name: '🏛️ Ban', value: pendingData.userData.ban, inline: true },
-            { name: '📋 Vai trò', value: pendingData.userData.role, inline: true },
-            { name: '👋 Chào mừng', value: `Chào mừng <@${member.id}>!`, inline: false }
-          )
-          .setThumbnail(member.user.displayAvatarURL({ size: 128 }))
-          .setFooter({ text: 'Enactus FTU Hanoi' })
-          .setTimestamp();
-        
-        await welcomeChannel.send({ embeds: [announcementEmbed] });
-      }
-      
       // Delete verification channel after 10 minutes
       setTimeout(async () => {
         try {
@@ -1045,9 +898,7 @@ client.on('interactionCreate', async (interaction) => {
             await channel.delete();
             console.log(`🗑️ Deleted verification channel for ${member.user.tag}`);
           }
-        } catch (error) {
-          // Channel might already be deleted
-        }
+        } catch (error) {}
       }, 10 * 60 * 1000);
       
       // Clean up
@@ -1071,7 +922,6 @@ client.on('interactionCreate', async (interaction) => {
       .setDescription('Thông tin hiển thị không khớp với tài khoản của bạn.')
       .addFields(
         { name: '📧 Email đã nhập', value: pendingData.email },
-        { name: '🔍 Nguyên nhân có thể', value: '• Email không chính xác\n• Thông tin hệ thống chưa cập nhật\n• Nhầm tài khoản' },
         { name: '🔧 Hỗ trợ', value: 'Vui lòng liên hệ Ban Kỹ thuật với email Enactus chính xác của bạn.' }
       )
       .setFooter({ text: 'Enactus FTU Hanoi - Ban Kỹ thuật' })
@@ -1089,9 +939,7 @@ client.on('interactionCreate', async (interaction) => {
         if (channel) {
           await channel.delete();
         }
-      } catch (error) {
-        // Channel might already be deleted
-      }
+      } catch (error) {}
     }, 5 * 60 * 1000);
     
     pendingVerifications.delete(member.id);
@@ -1127,41 +975,7 @@ async function checkUnverifiedMembers() {
     console.log(`🔍 Periodic check: ${unverifiedMembers.size} unverified members`);
     
     for (const member of unverifiedMembers.values()) {
-      try {
-        // Check if they have a pending verification
-        if (pendingVerifications.has(member.id)) continue;
-        
-        console.log(`⏰ Kicking ${member.user.tag} - Verification timeout`);
-        
-        try {
-          await member.send({
-            embeds: [
-              new EmbedBuilder()
-                .setColor('#F44336')
-                .setTitle('⏰ HẾT THỜI GIAN XÁC MINH')
-                .setDescription('Bạn đã bị tự động rời khỏi server Enactus FTU vì không hoàn thành xác minh trong 2 giờ.')
-                .addFields(
-                  { name: '📅 Tham gia lúc', value: new Date(member.joinedTimestamp).toLocaleString('vi-VN') },
-                  { name: '🔄 Tham gia lại', value: 'Bạn có thể join lại server và thử xác minh lần nữa.' },
-                  { name: '❓ Hỗ trợ', value: 'Liên hệ Ban Kỹ thuật nếu gặp vấn đề kỹ thuật.' }
-                )
-                .setFooter({ text: 'Enactus FTU Hanoi' })
-                .setTimestamp()
-            ]
-          });
-        } catch (dmError) {}
-        
-        await member.kick('Không hoàn thành xác minh trong 2 giờ (tự động)');
-        
-        // Clean up
-        pendingVerifications.delete(member.id);
-        const timeout = verificationTimeouts.get(member.id);
-        if (timeout) clearTimeout(timeout);
-        verificationTimeouts.delete(member.id);
-        
-      } catch (error) {
-        console.error(`❌ Error kicking ${member.user.tag}:`, error);
-      }
+      await handleVerificationTimeout(member);
     }
   } catch (error) {
     console.error('❌ Error in periodic check:', error);
@@ -1172,26 +986,20 @@ async function checkUnverifiedMembers() {
 // COMMAND REGISTRATION
 // ====================
 
-/**
- * Register slash commands
- */
 async function registerCommands() {
   try {
     const commands = [
       {
         name: 'verify',
-        description: 'Xác minh thành viên Enactus FTU',
-        options: []
+        description: 'Xác minh thành viên Enactus FTU'
       },
       {
         name: 'status',
-        description: 'Kiểm tra trạng thái xác minh của bạn',
-        options: []
+        description: 'Kiểm tra trạng thái xác minh của bạn'
       },
       {
         name: 'help',
-        description: 'Hiển thị hướng dẫn sử dụng bot',
-        options: []
+        description: 'Hiển thị hướng dẫn sử dụng bot'
       }
     ];
     
@@ -1232,10 +1040,6 @@ client.on('error', (error) => {
 
 client.on('warn', (info) => {
   console.warn('⚠️ Discord warning:', info);
-});
-
-client.on('disconnect', () => {
-  console.warn('⚠️ Bot disconnected from Discord');
 });
 
 // ====================
