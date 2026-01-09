@@ -17,6 +17,24 @@ const {
   Collection
 } = require('discord.js');
 
+// index.js - THÊM ĐOẠN NÀY
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('Bot is alive');
+});
+
+app.listen(PORT, () => {
+  console.log(`Health server on ${PORT}`);
+  
+  // Tự ping mình mỗi 5 phút
+  setInterval(() => {
+    fetch(`http://localhost:${PORT}`).catch(() => {});
+  }, 300000);
+});
+
 // Import Firebase từ SDK mới (v10+)
 const { initializeApp } = require('firebase/app');
 const { 
